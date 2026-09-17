@@ -481,22 +481,37 @@ DECLARE
   v_line_total NUMERIC;
   v_result JSONB;
 BEGIN
-  -- 1. Source Job details
+  -- 1. Validate Job & Customer first
   IF p_job_id IS NOT NULL THEN
     SELECT * INTO v_job FROM service_jobs WHERE id = p_job_id;
     IF v_job.id IS NULL THEN
       RAISE EXCEPTION 'Selected service job % not found', p_job_id;
     END IF;
     v_customer_id := v_job.customer_id;
+  END IF;
 
-    -- Add labor line item if cost specified
+  IF v_customer_id IS NULL THEN
+    RAISE EXCEPTION 'Customer ID is required for invoice creation';
+  END IF;
+
+  -- 2. Create the parent Invoice row FIRST to satisfy foreign key constraint invoice_items_invoice_id_fkey
+  INSERT INTO invoices (
+    id, job_id, customer_id, subtotal, discount_type, discount_rate,
+    discount_amount, tax_rate, tax_amount, total, status, paid_at
+  ) VALUES (
+    v_inv_id, p_job_id, v_customer_id, 0, v_disc_type, 0,
+    0, v_tax_rate, 0, 0, v_status,
+    CASE WHEN v_status = 'Paid' THEN now() ELSE NULL END
+  );
+
+  -- 3. Source Job details and insert line items
+  IF p_job_id IS NOT NULL THEN
     IF p_labor_cost > 0 THEN
       INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, total_price, is_part)
       VALUES (gen_random_uuid(), v_inv_id, 'Repair Service & Labor (' || COALESCE(v_job.device_brand, '') || ' ' || COALESCE(v_job.device_model, v_job.device_type) || ')', 1, p_labor_cost, p_labor_cost, false);
       v_subtotal := v_subtotal + p_labor_cost;
     END IF;
 
-    -- Add attached job parts
     FOR v_jp IN
       SELECT jp.*, p.name AS part_name, p.part_number
       FROM job_parts jp LEFT JOIN parts p ON jp.part_id = p.id WHERE jp.job_id = p_job_id
@@ -508,7 +523,7 @@ BEGIN
     END LOOP;
   END IF;
 
-  -- 2. Process direct line items
+  -- 4. Process direct line items
   IF p_items IS NOT NULL AND jsonb_array_length(p_items) > 0 THEN
     FOR v_item IN SELECT * FROM jsonb_to_recordset(p_items) AS (part_id UUID, description TEXT, quantity INT, unit_price NUMERIC) LOOP
       v_line_total := v_item.quantity * v_item.unit_price;
@@ -516,7 +531,6 @@ BEGIN
       VALUES (gen_random_uuid(), v_inv_id, v_item.part_id, COALESCE(v_item.description, 'Service / Part item'), v_item.quantity, v_item.unit_price, v_line_total, (v_item.part_id IS NOT NULL));
       v_subtotal := v_subtotal + v_line_total;
 
-      -- If direct part sale, validate & deduct stock
       IF v_item.part_id IS NOT NULL THEN
         SELECT name, quantity INTO v_part FROM parts WHERE id = v_item.part_id FOR UPDATE;
         IF v_part.quantity < v_item.quantity THEN
@@ -535,11 +549,7 @@ BEGIN
     v_subtotal := v_subtotal + p_labor_cost;
   END IF;
 
-  IF v_customer_id IS NULL THEN
-    RAISE EXCEPTION 'Customer ID is required for invoice creation';
-  END IF;
-
-  -- 3. Calculate tax & discounts
+  -- 5. Calculate tax & discounts and update parent Invoice totals
   v_tax_amount := (v_subtotal * v_tax_rate) / 100;
   IF v_disc_type = 'percentage' THEN
     v_disc_rate := LEAST(100, GREATEST(0, COALESCE(p_discount_value, 0)));
@@ -551,17 +561,17 @@ BEGIN
 
   v_grand_total := GREATEST(0, (v_subtotal + v_tax_amount) - v_disc_amount);
 
-  -- 4. Create Invoice
-  INSERT INTO invoices (
-    id, job_id, customer_id, subtotal, discount_type, discount_rate,
-    discount_amount, tax_rate, tax_amount, total, status, paid_at
-  ) VALUES (
-    v_inv_id, p_job_id, v_customer_id, v_subtotal, v_disc_type, v_disc_rate,
-    v_disc_amount, v_tax_rate, v_tax_amount, v_grand_total, v_status,
-    CASE WHEN v_status = 'Paid' THEN now() ELSE NULL END
-  );
+  UPDATE invoices SET
+    subtotal = v_subtotal,
+    discount_type = v_disc_type,
+    discount_rate = v_disc_rate,
+    discount_amount = v_disc_amount,
+    tax_rate = v_tax_rate,
+    tax_amount = v_tax_amount,
+    total = v_grand_total
+  WHERE id = v_inv_id;
 
-  -- 5. Return complete invoice
+  -- 6. Return complete invoice
   SELECT row_to_json(t)::jsonb INTO v_result
   FROM (
     SELECT i.*,
