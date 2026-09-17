@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  # ───────────────────────────────────────────────────────────
+  # PostgreSQL Database Container
+  # ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: fixdesk-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:?DB_NAME must be set in .env}
+      POSTGRES_USER: ${DB_USER:?DB_USER must be set in .env}
+      POSTGRES_PASSWORD: ${DB_PASS:?DB_PASS must be set in .env}
+    volumes:
+      # TrueNAS persistent dataset or named docker volume
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-admin} -d ${DB_NAME:-fixdesk}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fixdesk-net
+
+  # ───────────────────────────────────────────────────────────
+  # Backend API Server
+  # ───────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fixdesk-backend
+    restart: unless-stopped
+    environment:
+      PORT: 4000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:?DB_NAME must be set in .env}
+      DB_USER: ${DB_USER:?DB_USER must be set in .env}
+      DB_PASS: ${DB_PASS:?DB_PASS must be set in .env}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env — generate with: node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - fixdesk-net
+
+  # ───────────────────────────────────────────────────────────
+  # Frontend Web UI (NGINX SPA + Reverse Proxy)
+  # ───────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: fixdesk-frontend
+    restart: unless-stopped
+    ports:
+      # Access FixDesk at http://<TRUENAS-IP>:3000
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      - backend
+    networks:
+      - fixdesk-net
+
+networks:
+  fixdesk-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
